@@ -1,77 +1,85 @@
 import uvicorn
-from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from starlette.responses import JSONResponse
+from sqlalchemy import Integer, select
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped
+from fastapi import FastAPI, Depends
+from typing import Annotated
+
 
 app = FastAPI()
 
 
-@app.get("/", summary="Ручка", tags=["Некий главный сервис"])
-def home():
-    return {"message": "Hello World"}
-
-
-books = [
-    {
-        "id": 1,
-        "title": "Некая книжка",
-        "author": "Пупкин",
-    },
-    {
-        "id": 2,
-        "title": "Синяя книжка",
-        "author": "Пампум",
-    },
-]
-
-
-@app.get(
-    "/books",
-    tags=["Книги"],
-    summary="Получить все книги",
+engine = create_async_engine(
+    "sqlite+aiosqlite:///books.db",
+    echo=True
 )
-def read_books():
-    return JSONResponse(
-        content=books,
-        media_type="application/json; charset=utf-8"
-    )
 
-
-@app.get(
-    "/books/{book_id}",
-    tags=["Книги"],
-    summary="Получить конкретную книгу",
+new_session = async_sessionmaker(
+    engine,
+    expire_on_commit=False
 )
-def read_book(book_id: int):
-    for book in books:
-        if book["id"] == book_id:
-            return JSONResponse(
-                content=book,
-                media_type="application/json; charset=utf-8"
-            )
-    raise HTTPException(status_code=404, detail="Нет такой книги")
 
 
-class NewBook(BaseModel):
+async def get_session():
+    async with new_session() as session:
+        yield session
+
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Book(Base):
+    __tablename__ = "books"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column()
+    author: Mapped[str] = mapped_column()
+
+
+@app.post("/setup_database")
+async def create_table():
+    async with engine.begin() as conn:
+        await conn.run_sync(
+            lambda sync_conn: Base.metadata.create_all(sync_conn)
+        )
+    return {"status": "ok"}
+
+class BookSchema(BaseModel):
+    id: int
     title: str
     author: str
 
+    class Config:
+        from_attributes = True
 
-@app.post(
-    "/books",
-    tags=["Книги"],
-    summary="Добавить книгу",
-)
-def create_book(new_book: NewBook):
-    books.append(
-        {
-            "id": len(books) + 1,
-            "title": new_book.title,
-            "author": new_book.author,
-        }
+@app.get("/books", response_model=list[BookSchema])
+async def get_books(
+    session = Depends(get_session)
+):
+    result = await session.execute(
+        select(Book)
     )
-    return { "success": True, "message": "Книга успешно добавлена" }
 
+    return result.scalars().all()
+
+class BookAddSchema(BaseModel):
+    id: int
+    title: str
+    author: str
+
+@app.post("/books")
+async def add_book(data: BookAddSchema, session:SessionDep):
+    new_book = Book(
+        id=data.id,
+        title=data.title,
+        author=data.author,
+    )
+    session.add(new_book)
+    await session.commit()
+    return {"status": "ok"}
 
 if __name__ == "__main__":
     uvicorn.run("main:app", reload=True)
